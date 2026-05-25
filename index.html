@@ -4225,7 +4225,8 @@ function renderRecurringClients(clients){
 <script>
 // ══════════════════════════════════════
 //  SURKO — Firebase Sync estable
-//  Conserva datos locales cargados y sincroniza en vivo entre dispositivos
+//  Firestore es la fuente compartida; localStorage queda como caché con versión local.
+//  Corrige el retroceso de datos por snapshots remotos viejos.
 // ══════════════════════════════════════
 const firebaseConfig=window.SURKO_FIREBASE_CONFIG||{
   apiKey:"AIzaSyCr6HHjYdStOAHpdPCNqz8bYnhZmVzadFk",
@@ -4259,11 +4260,24 @@ function initFirebaseSync(){
     const syncKeys=['categories','products','config','banner','clients','orders','next_order_id','ticket_template','form_fields','hero_content','promos','banner_img'];
     const timers={};
     const remoteUpdated={};
+    const pendingPush={};
+    const bootstrapped={};
+    const META_KEY='surko_sync_local_versions_v2';
 
     function docRef(key){return db.collection(SURKO_SYNC_COLLECTION).doc(key);}
     function nowIso(){return new Date().toISOString();}
     function safeClone(v){try{return JSON.parse(JSON.stringify(v));}catch(e){return v;}}
-    function stableString(v){try{return JSON.stringify(v||null);}catch(e){return String(v);}}
+    function stableString(v){try{return JSON.stringify(v===undefined?null:v);}catch(e){return String(v);}}
+    function getMeta(){try{return JSON.parse(localStorage.getItem(META_KEY)||'{}')||{};}catch(e){return {};}}
+    function setMetaKey(key,stamp){try{const m=getMeta();m[key]=stamp;localStorage.setItem(META_KEY,JSON.stringify(m));}catch(e){}}
+    function getLocalStamp(key){const m=getMeta();return m[key]||'';}
+    function markLocalChange(key){const stamp=nowIso();setMetaKey(key,stamp);return stamp;}
+    function compareStamp(a,b){
+      if(!a&&!b)return 0;
+      if(a&&!b)return 1;
+      if(!a&&b)return -1;
+      return String(a)>String(b)?1:(String(a)<String(b)?-1:0);
+    }
     function valueScore(key,v){
       if(v===null||typeof v==='undefined')return 0;
       if(Array.isArray(v)){
@@ -4288,7 +4302,7 @@ function initFirebaseSync(){
       }catch(e){}
       return false;
     }
-    function shouldKeepLocal(key,local,remote){
+    function shouldKeepLocalByContent(key,local,remote){
       if(local===null||typeof local==='undefined')return false;
       if(remote===null||typeof remote==='undefined')return true;
       if(key==='next_order_id')return Number(local||0)>Number(remote||0);
@@ -4308,21 +4322,38 @@ function initFirebaseSync(){
 
     async function pushKey(key){
       if(!window.__syncDb)return;
+      let stamp=getLocalStamp(key);
+      if(!stamp){stamp=nowIso();setMetaKey(key,stamp);}
       const value=safeClone(LS.get(key));
+      pendingPush[key]=stamp;
       try{
-        const stamp=nowIso();
-        await docRef(key).set({value:value,updatedAt:stamp,clientId:window.__syncClientId},{merge:true});
+        await docRef(key).set({
+          value:value,
+          updatedAt:stamp,
+          clientId:window.__syncClientId,
+          schemaVersion:2
+        },{merge:true});
         remoteUpdated[key]=stamp;
+        if(pendingPush[key]===stamp)delete pendingPush[key];
         window.__syncReady=true;
         updateSyncBadges();
-      }catch(err){console.log('Sync push error',key,err.message);}
+      }catch(err){
+        console.log('Sync push error',key,err.message);
+        window.__syncReady=false;
+        updateSyncBadges();
+      }
+    }
+
+    function schedulePush(key){
+      clearTimeout(timers[key]);
+      timers[key]=setTimeout(()=>pushKey(key),250);
     }
 
     LS.set=function(key,value){
       baseSet(key,value);
       if(syncKeys.includes(key)){
-        clearTimeout(timers[key]);
-        timers[key]=setTimeout(()=>pushKey(key),250);
+        markLocalChange(key);
+        schedulePush(key);
       }
     };
 
@@ -4360,49 +4391,105 @@ function initFirebaseSync(){
       }
     };
 
+    function applyRemoteValue(key,remote,stamp){
+      baseSet(key,remote);
+      if(stamp)setMetaKey(key,stamp);
+      remoteUpdated[key]=stamp||remoteUpdated[key]||'';
+      if(typeof window.handleSyncedUpdate==='function')window.handleSyncedUpdate(key);
+    }
+
+    async function resolveInitialValue(key){
+      const local=LS.get(key);
+      const localStamp=getLocalStamp(key);
+      const snap=await docRef(key).get();
+
+      if(snap.exists&&snap.data()&&typeof snap.data().value!=='undefined'){
+        const data=snap.data();
+        const remote=data.value;
+        const remoteStamp=data.updatedAt||'';
+        remoteUpdated[key]=remoteStamp;
+
+        const stampCmp=compareStamp(localStamp,remoteStamp);
+        if(local!==null&&typeof local!=='undefined'&&stampCmp>0){
+          await pushKey(key);
+          return;
+        }
+        if(local!==null&&typeof local!=='undefined'&&stampCmp===0&&shouldKeepLocalByContent(key,local,remote)){
+          if(!localStamp){setMetaKey(key,nowIso());}
+          await pushKey(key);
+          return;
+        }
+        if(local!==null&&typeof local!=='undefined'&&!localStamp&&shouldKeepLocalByContent(key,local,remote)){
+          markLocalChange(key);
+          await pushKey(key);
+          return;
+        }
+        if(stableString(remote)!==stableString(local)){
+          applyRemoteValue(key,remote,remoteStamp);
+        }else if(remoteStamp){
+          setMetaKey(key,remoteStamp);
+        }
+      }else if(local!==null&&typeof local!=='undefined'){
+        if(!localStamp)markLocalChange(key);
+        await pushKey(key);
+      }
+    }
+
+    function listenKey(key){
+      docRef(key).onSnapshot(doc=>{
+        if(!bootstrapped[key])return;
+        if(!doc.exists||!doc.data()||typeof doc.data().value==='undefined')return;
+        const data=doc.data();
+        const remote=data.value;
+        const remoteStamp=data.updatedAt||'';
+        const localNow=LS.get(key);
+        const localStamp=getLocalStamp(key);
+        const sameValue=stableString(remote)===stableString(localNow);
+
+        if(data.clientId===window.__syncClientId&&sameValue){
+          if(remoteStamp)setMetaKey(key,remoteStamp);
+          remoteUpdated[key]=remoteStamp;
+          if(pendingPush[key]===remoteStamp)delete pendingPush[key];
+          window.__syncReady=true;updateSyncBadges();return;
+        }
+
+        if(pendingPush[key]&&compareStamp(pendingPush[key],remoteStamp)>0){
+          return;
+        }
+
+        if(localStamp&&compareStamp(localStamp,remoteStamp)>0){
+          if(!sameValue)schedulePush(key);
+          return;
+        }
+
+        if(remoteUpdated[key]&&compareStamp(remoteUpdated[key],remoteStamp)>0){
+          return;
+        }
+
+        if(!sameValue){
+          applyRemoteValue(key,remote,remoteStamp);
+        }else if(remoteStamp){
+          setMetaKey(key,remoteStamp);
+          remoteUpdated[key]=remoteStamp;
+        }
+        window.__syncReady=true;
+        updateSyncBadges();
+      },err=>{
+        console.log('Sync listen error',key,err.message);
+        window.__syncReady=false;
+        updateSyncBadges();
+      });
+    }
+
     async function bootstrapSync(){
       try{
         window.__syncReady=false;
         updateSyncBadges();
 
         for(const key of syncKeys){
-          const local=LS.get(key);
-          const snap=await docRef(key).get();
-
-          if(snap.exists&&snap.data()&&typeof snap.data().value!=='undefined'){
-            const data=snap.data();
-            const remote=data.value;
-            remoteUpdated[key]=data.updatedAt||'';
-
-            if(shouldKeepLocal(key,local,remote)){
-              baseSet(key,local);
-              await pushKey(key);
-            }else{
-              baseSet(key,remote);
-            }
-          }else if(local!==null&&typeof local!=='undefined'){
-            await pushKey(key);
-          }
-
-          docRef(key).onSnapshot(doc=>{
-            if(!doc.exists||!doc.data()||typeof doc.data().value==='undefined')return;
-            const data=doc.data();
-            const remote=data.value;
-            const stamp=data.updatedAt||'';
-            const localNow=LS.get(key);
-
-            if(data.clientId===window.__syncClientId&&stableString(remote)===stableString(localNow)){
-              window.__syncReady=true;updateSyncBadges();return;
-            }
-            if(stamp&&remoteUpdated[key]&&stamp<remoteUpdated[key])return;
-            if(stableString(remote)!==stableString(localNow)){
-              baseSet(key,remote);
-              remoteUpdated[key]=stamp;
-              if(typeof window.handleSyncedUpdate==='function')window.handleSyncedUpdate(key);
-            }
-            window.__syncReady=true;
-            updateSyncBadges();
-          });
+          await resolveInitialValue(key);
+          bootstrapped[key]=true;
+          listenKey(key);
         }
 
         window.__syncReady=true;
@@ -4415,16 +4502,19 @@ function initFirebaseSync(){
       }
     }
 
-    window.forcePushLocalDataToFirebase=function(){return Promise.all(syncKeys.map(pushKey));};
+    window.forcePushLocalDataToFirebase=function(){
+      syncKeys.forEach(k=>{if(!getLocalStamp(k))markLocalChange(k);});
+      return Promise.all(syncKeys.map(pushKey));
+    };
     window.forcePullFirebaseData=function(){
       return Promise.all(syncKeys.map(async key=>{
         const snap=await docRef(key).get();
         if(snap.exists&&snap.data()&&typeof snap.data().value!=='undefined'){
-          baseSet(key,snap.data().value);
-          if(typeof window.handleSyncedUpdate==='function')window.handleSyncedUpdate(key);
+          applyRemoteValue(key,snap.data().value,snap.data().updatedAt||nowIso());
         }
       }));
     };
+    window.resetLocalSyncVersions=function(){localStorage.removeItem(META_KEY);};
 
     bootstrapSync();
   }catch(e){console.log('Firebase:',e.message);}
